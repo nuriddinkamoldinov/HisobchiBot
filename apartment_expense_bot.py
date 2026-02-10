@@ -29,9 +29,9 @@ logger = logging.getLogger(__name__)
 
 # Conversation states
 (START, ENTER_NAME, CREATE_OR_JOIN, CREATE_HOME_NAME, CREATE_HOME_PASSWORD,
- JOIN_HOME_NAME, JOIN_HOME_PASSWORD, MAIN_MENU, MANAGE_HOME, 
- ENTER_EXPENSE, ENTER_CONSUMERS, EDIT_HOME_NAME, EDIT_HOME_PASSWORD,
- DELETE_MEMBER, ASSIGN_NEW_ADMIN, CHANGE_USER_NAME) = range(16)
+ CONNECT_GROUP_AFTER_CREATE, JOIN_HOME_NAME, JOIN_HOME_PASSWORD, MAIN_MENU, MANAGE_HOME,
+ ENTER_EXPENSE, ENTER_REASON, ENTER_CONSUMERS, EDIT_HOME_NAME, EDIT_HOME_PASSWORD,
+ DELETE_MEMBER, ASSIGN_NEW_ADMIN, CHANGE_USER_NAME) = range(18)
 
 # Database setup
 def init_db():
@@ -52,17 +52,45 @@ def init_db():
                  (home_id INTEGER PRIMARY KEY AUTOINCREMENT,
                   home_name TEXT UNIQUE,
                   password TEXT,
-                  created_at TEXT)''')
-    
+                  created_at TEXT,
+                  group_chat_id INTEGER,
+                  message_thread_id INTEGER,
+                  waiting_for_group INTEGER DEFAULT 0)''')
+
     # Transactions table
     c.execute('''CREATE TABLE IF NOT EXISTS transactions
                  (transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
                   home_id INTEGER,
                   payer_id INTEGER,
                   amount REAL,
+                  reason TEXT,
                   consumers TEXT,
                   created_at TEXT,
                   week_number INTEGER)''')
+
+    # Add group_chat_id column to existing homes table if it doesn't exist
+    try:
+        c.execute('ALTER TABLE homes ADD COLUMN group_chat_id INTEGER')
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Add message_thread_id column to existing homes table if it doesn't exist
+    try:
+        c.execute('ALTER TABLE homes ADD COLUMN message_thread_id INTEGER')
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Add waiting_for_group column to existing homes table if it doesn't exist
+    try:
+        c.execute('ALTER TABLE homes ADD COLUMN waiting_for_group INTEGER DEFAULT 0')
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Add reason column to existing transactions table if it doesn't exist
+    try:
+        c.execute('ALTER TABLE transactions ADD COLUMN reason TEXT')
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     
     conn.commit()
     conn.close()
@@ -127,15 +155,35 @@ def get_home_members(home_id):
     conn.close()
     return members
 
-def add_transaction(home_id, payer_id, amount, consumers):
+def get_group_chat_id(home_id):
+    """Get group chat ID and message thread ID for a home"""
+    conn = sqlite3.connect('apartment_bot.db')
+    c = conn.cursor()
+    c.execute('SELECT group_chat_id, message_thread_id FROM homes WHERE home_id = ?', (home_id,))
+    result = c.fetchone()
+    conn.close()
+    if result:
+        return result[0], result[1]  # (group_chat_id, message_thread_id)
+    return None, None
+
+def set_group_chat_id(home_id, group_chat_id, message_thread_id=None):
+    """Set group chat ID and message thread ID for a home"""
+    conn = sqlite3.connect('apartment_bot.db')
+    c = conn.cursor()
+    c.execute('UPDATE homes SET group_chat_id = ?, message_thread_id = ? WHERE home_id = ?',
+              (group_chat_id, message_thread_id, home_id))
+    conn.commit()
+    conn.close()
+
+def add_transaction(home_id, payer_id, amount, reason, consumers):
     """Add a transaction to the database"""
     conn = sqlite3.connect('apartment_bot.db')
     c = conn.cursor()
     week_number = datetime.now().isocalendar()[1]
-    c.execute('''INSERT INTO transactions 
-                 (home_id, payer_id, amount, consumers, created_at, week_number)
-                 VALUES (?, ?, ?, ?, ?, ?)''',
-              (home_id, payer_id, amount, ','.join(map(str, consumers)), 
+    c.execute('''INSERT INTO transactions
+                 (home_id, payer_id, amount, reason, consumers, created_at, week_number)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)''',
+              (home_id, payer_id, amount, reason, ','.join(map(str, consumers)),
                datetime.now().isoformat(), week_number))
     conn.commit()
     conn.close()
@@ -354,22 +402,193 @@ async def create_home_password(update: Update, context: ContextTypes.DEFAULT_TYP
     password = update.message.text.strip()
     home_name = context.user_data['home_name']
     user = update.effective_user
-    
+
     home_id = create_home(home_name, password, user.id)
-    
+
     if home_id:
+        # Set waiting_for_group flag in database
+        conn = sqlite3.connect('apartment_bot.db')
+        c = conn.cursor()
+        c.execute('UPDATE homes SET waiting_for_group = 1 WHERE home_id = ?', (home_id,))
+        conn.commit()
+        conn.close()
+
+        # Store info for later
+        context.user_data['home_id'] = home_id
+        context.user_data['home_name'] = home_name
+        context.user_data['home_password'] = password
+
         await update.message.reply_text(
-            f"✅ '{home_name}' uyi muvaffaqiyatli yaratildi!\n"
-            f"Siz administratorsiz.\n\n"
-            f"Ushbu ma'lumotlarni sherikl aringizga bering:\n"
-            f"Uy nomi: {home_name}\n"
-            f"Parol: {password}"
+            f"✅ '{home_name}' uyi yaratildi!\n\n"
+            f"📱 Endi guruh chatini ulash kerak:\n\n"
+            f"1️⃣ Guruh yarating (yoki mavjud guruhdan foydalaning)\n"
+            f"2️⃣ Meni guruhga qo'shing\n"
+            f"3️⃣ Guruhda biror xabar yuboring (masalan: 'Test')\n\n"
+            f"Guruhda xabar yuborganingizdan keyin, avtomatik ulanadi!"
+            f"\n\n📋 Sheriklar uchun:\n"
+            f"🏠 Uy nomi: {home_name}\n"
+            f"🔑 Parol: {password}"
         )
-        await menu(update, context)
+        # Conversation ends - handle_group_message will handle the connection
+        return ConversationHandler.END
     else:
         await update.message.reply_text(
             "❌ Bu nomdagi uy allaqachon mavjud. Iltimos, /start buyrug'i bilan qaytadan urinib ko'ring"
         )
+        return ConversationHandler.END
+
+async def debug_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Debug: Log ALL messages"""
+    if update.message:
+        logger.info(f"[DEBUG] Message received: chat_type={update.effective_chat.type}, user={update.effective_user.id}, text={update.message.text[:50] if update.message.text else 'no text'}")
+
+async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle any message in a group - check if user is waiting to connect"""
+    chat = update.effective_chat
+    user = update.effective_user
+    message = update.message
+
+    # Only process if it's a group
+    if chat.type not in ['group', 'supergroup']:
+        return
+
+    logger.info(f"Group message from user {user.id} in chat {chat.id}")
+
+    # Check if this user is waiting to connect a group
+    conn = sqlite3.connect('apartment_bot.db')
+    c = conn.cursor()
+    c.execute('''SELECT h.home_id, h.home_name, h.password, h.waiting_for_group
+                 FROM homes h
+                 JOIN users u ON h.home_id = u.home_id
+                 WHERE u.user_id = ? AND u.is_admin = 1 AND h.waiting_for_group = 1''',
+              (user.id,))
+    result = c.fetchone()
+    conn.close()
+
+    if not result:
+        logger.info(f"User {user.id} not waiting for group connection")
+        return
+
+    home_id, home_name, password, waiting = result
+    logger.info(f"User {user.id} IS waiting! Connecting group {chat.id} to home {home_id}")
+
+    # Get thread ID if in a topic
+    message_thread_id = message.message_thread_id if message.is_topic_message else None
+
+    # Connect the group
+    set_group_chat_id(home_id, chat.id, message_thread_id)
+
+    # Clear waiting flag
+    conn = sqlite3.connect('apartment_bot.db')
+    c = conn.cursor()
+    c.execute('UPDATE homes SET waiting_for_group = 0 WHERE home_id = ?', (home_id,))
+    conn.commit()
+    conn.close()
+
+    # Send confirmation in group
+    await update.message.reply_text(
+        f"✅ Guruh '{home_name}' uyiga ulandi!\n\n"
+        "Barcha harajatlar shu yerga avtomatik yuboriladi."
+        + (f"\n\n📌 Mavzu: Bu mavzuga yuboriladi" if message_thread_id else "")
+    )
+
+    # Send confirmation and menu in private chat
+    try:
+        await context.bot.send_message(
+            chat_id=user.id,
+            text="✅ Guruh muvaffaqiyatli ulandi! Endi harajatlarni yozishingiz mumkin."
+        )
+
+        # Show menu in private chat
+        user_data = get_user(user.id)
+        is_admin = user_data[4]
+
+        if is_admin:
+            keyboard = [
+                ['Uyni boshqarish'],
+                ['Hisoblarni ko\'rish (Yangilash)', 'Hisoblarni ko\'rish'],
+                ['Ismni o\'zgartirish', 'Uydan chiqish']
+            ]
+        else:
+            keyboard = [
+                ['Hisoblarni ko\'rish'],
+                ['Ismni o\'zgartirish', 'Uydan chiqish']
+            ]
+
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        role = "Administrator" if is_admin else "A'zo"
+
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=f"🏠 Asosiy menyu ({role})\n\nVariantni tanlang yoki harajat qo'shish uchun raqam yuboring:",
+            reply_markup=reply_markup
+        )
+    except Exception as e:
+        logger.error(f"Could not send private message: {e}")
+
+    logger.info(f"Group {chat.id} successfully connected to home {home_id}")
+
+async def connect_group_after_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Capture group chat ID and thread ID after home creation"""
+    chat = update.effective_chat
+    user = update.effective_user
+    message = update.message
+
+    logger.info(f"connect_group_after_create called by user {user.id} in chat {chat.id} (type: {chat.type})")
+    logger.info(f"context.user_data: {context.user_data}")
+
+    # Verify this is the user who created the home
+    if 'home_id' not in context.user_data:
+        logger.warning(f"User {user.id} has no home_id in context, ignoring")
+        # Someone else sent a message, ignore it
+        return CONNECT_GROUP_AFTER_CREATE
+
+    # Check if message is from a group
+    if chat.type not in ['group', 'supergroup']:
+        logger.warning(f"Message not from group, chat type: {chat.type}")
+        await update.message.reply_text(
+            "❌ Iltimos, guruh chatida xabar yuboring!\n\n"
+            "Meni guruhga qo'shib, guruhda biror xabar yuboring."
+        )
+        return CONNECT_GROUP_AFTER_CREATE
+
+    # Get message thread ID (for topics/forums)
+    message_thread_id = message.message_thread_id if message.is_topic_message else None
+    logger.info(f"Message thread ID: {message_thread_id}")
+
+    # Save the group chat ID and thread ID
+    home_id = context.user_data['home_id']
+    logger.info(f"Saving group {chat.id} to home {home_id}")
+    set_group_chat_id(home_id, chat.id, message_thread_id)
+
+    home_name = context.user_data['home_name']
+    home_password = context.user_data['home_password']
+
+    # Send confirmation in the group (same thread if topics enabled)
+    logger.info(f"Sending confirmation to group {chat.id}")
+    await update.message.reply_text(
+        f"✅ Guruh '{home_name}' uyiga ulandi!\n\n"
+        "Barcha harajatlar shu yerga avtomatik yuboriladi."
+        + (f"\n\n📌 Mavzu: Bu mavzuga yuboriladi" if message_thread_id else "")
+    )
+
+    # Send setup complete message in private chat
+    try:
+        logger.info(f"Sending confirmation to private chat {user.id}")
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=(
+                f"✅ Guruh muvaffaqiyatli ulandi!\n\n"
+                f"📋 Ushbu ma'lumotlarni sheriklаringizga bering:\n"
+                f"🏠 Uy nomi: {home_name}\n"
+                f"🔑 Parol: {home_password}\n\n"
+                f"Endi harajatlarni yozishingiz mumkin!"
+            )
+        )
+        await menu(update, context)
+        logger.info("Group connection completed successfully")
+    except Exception as e:
+        logger.error(f"Shaxsiy chatga xabar yuborib bo'lmadi: {e}")
 
     return ConversationHandler.END
 
@@ -630,24 +849,18 @@ async def auto_detect_expense(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Valid amount detected, start expense flow
     context.user_data['expense_amount'] = amount
 
-    # Get home members
-    home_id = user_data[3]
-    members = get_home_members(home_id)
-
-    # Show members list
-    message = "👥 Bu mahsulotni kim iste'mol qiladi?\n\n"
-    message += "0. Barcha a'zolarni tanlash uchun\n"
-    for idx, (member_id, name, is_admin) in enumerate(members, 1):
-        message += f"{idx}. {name}\n"
-    message += "\nRaqamlarni bo'sh joy bilan ajratib kiriting (masalan, '1 3 5')\nYoki hammani tanlash uchun '0' ni kiriting:"
-
+    # Ask for reason
     keyboard = [['Bekor qilish']]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
 
-    context.user_data['members_list'] = members
-    await update.message.reply_text(message, reply_markup=reply_markup)
+    await update.message.reply_text(
+        f"💰 Harajat: {amount:,.0f} so'm\n\n"
+        "📝 Nima uchun sarflandi? (Mahsulotlarni kiriting)\n\n"
+        "Har bir mahsulotni alohida qatorda yoki bir qatorda yozing:",
+        reply_markup=reply_markup
+    )
 
-    return ENTER_CONSUMERS
+    return ENTER_REASON
 
 async def enter_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle expense amount entry"""
@@ -660,6 +873,30 @@ async def enter_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ENTER_EXPENSE
 
     context.user_data['expense_amount'] = amount
+
+    # Ask for reason
+    keyboard = [['Bekor qilish']]
+    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+
+    await update.message.reply_text(
+        f"💰 Harajat: {amount:,.0f} so'm\n\n"
+        "📝 Nima uchun sarflandi? (Mahsulotlarni kiriting)\n\n"
+        "Har bir mahsulotni alohida qatorda yoki bir qatorda yozing:",
+        reply_markup=reply_markup
+    )
+
+    return ENTER_REASON
+
+async def enter_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle expense reason entry"""
+    # Check for cancel
+    if update.message.text == 'Bekor qilish':
+        await update.message.reply_text("❌ Harajat bekor qilindi.")
+        await menu(update, context)
+        return ConversationHandler.END
+
+    reason = update.message.text.strip()
+    context.user_data['expense_reason'] = reason
 
     # Get home members
     user = update.effective_user
@@ -725,20 +962,52 @@ async def enter_consumers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_data = get_user(user.id)
         home_id = user_data[3]
         amount = context.user_data['expense_amount']
+        reason = context.user_data.get('expense_reason', 'Sabab ko\'rsatilmagan')
 
-        add_transaction(home_id, user.id, amount, consumer_ids)
+        add_transaction(home_id, user.id, amount, reason, consumer_ids)
 
         share = amount / len(consumer_ids)
-        # Format consumer names, each on a new line
-        consumer_list = '\n'.join(consumer_names)
 
+        # Send confirmation to user
+        consumer_list = '\n'.join(consumer_names)
         await update.message.reply_text(
             f"✅ Harajat yozildi!\n\n"
             f"Miqdor: {amount:,.0f} so'm\n"
+            f"Sabab: {reason}\n"
             f"Bo'linadi:\n\n"
             f"{consumer_list}\n\n"
             f"Har biri to'laydi: {share:,.0f} so'm"
         )
+
+        # Send notification to group
+        group_chat_id, message_thread_id = get_group_chat_id(home_id)
+        if group_chat_id:
+            # Check if all members are consumers
+            all_members = len(consumer_ids) == len(members)
+
+            if all_members:
+                consumer_text = "Barcha uy a'zolari"
+            else:
+                consumer_text = '\n'.join([f"{idx}. {name}" for idx, name in enumerate(consumer_names, 1)])
+
+            group_message = (
+                f"💸 Harajat: {amount:,.0f}\n\n"
+                f"📄 Sabab:\n\n"
+                f"{reason}\n\n"
+                f"👥 Iste'molchilar:\n\n"
+                f"{consumer_text}\n\n"
+                f"👤 Har biriga: {share:,.0f}"
+            )
+
+            try:
+                # Send to specific topic if message_thread_id exists
+                await context.bot.send_message(
+                    chat_id=group_chat_id,
+                    text=group_message,
+                    message_thread_id=message_thread_id
+                )
+            except Exception as e:
+                logger.error(f"Guruhga xabar yuborib bo'lmadi: {e}")
 
         await menu(update, context)
         return ConversationHandler.END
@@ -964,6 +1233,7 @@ def main():
             CREATE_OR_JOIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_or_join)],
             CREATE_HOME_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_home_name)],
             CREATE_HOME_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_home_password)],
+            # CONNECT_GROUP_AFTER_CREATE removed - handled by handle_group_message instead
             JOIN_HOME_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, join_home_name)],
             JOIN_HOME_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, join_home_password)],
             CHANGE_USER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, change_user_name)],
@@ -975,6 +1245,7 @@ def main():
     auto_expense_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, auto_detect_expense)],
         states={
+            ENTER_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_reason)],
             ENTER_CONSUMERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_consumers)],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
@@ -1001,6 +1272,9 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)],
     )
 
+    # DEBUG: Add this first to see ALL messages
+    application.add_handler(MessageHandler(filters.ALL, debug_all_messages), group=-1)
+
     application.add_handler(conv_handler)
     application.add_handler(manage_handler)
     application.add_handler(change_name_handler)
@@ -1008,6 +1282,11 @@ def main():
     application.add_handler(MessageHandler(
         filters.Regex(r"^(Hisoblarni ko'rish|Hisoblarni ko'rish \(Yangilash\)|Uydan chiqish)$"),
         handle_menu_choice
+    ))
+    # Handle group messages for connecting groups (must be before auto_expense_handler)
+    application.add_handler(MessageHandler(
+        filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
+        handle_group_message
     ))
     # Auto-detect expense handler should be last to not interfere with other handlers
     application.add_handler(auto_expense_handler)
