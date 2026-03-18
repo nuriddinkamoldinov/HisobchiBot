@@ -31,7 +31,8 @@ logger = logging.getLogger(__name__)
 (START, ENTER_NAME, CREATE_OR_JOIN, CREATE_HOME_NAME, CREATE_HOME_PASSWORD,
  CONNECT_GROUP_AFTER_CREATE, JOIN_HOME_NAME, JOIN_HOME_PASSWORD, MAIN_MENU, MANAGE_HOME,
  ENTER_EXPENSE, ENTER_REASON, ENTER_CONSUMERS, EDIT_HOME_NAME, EDIT_HOME_PASSWORD,
- DELETE_MEMBER, ASSIGN_NEW_ADMIN, CHANGE_USER_NAME) = range(18)
+ DELETE_MEMBER, ASSIGN_NEW_ADMIN, CHANGE_USER_NAME, ENTER_BANK_CARD,
+ EGG_ACTION, EGG_PRICE) = range(21)
 
 # Database setup
 def init_db():
@@ -91,7 +92,33 @@ def init_db():
         c.execute('ALTER TABLE transactions ADD COLUMN reason TEXT')
     except sqlite3.OperationalError:
         pass  # Column already exists
-    
+
+    # Add bank_card column to existing users table if it doesn't exist
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN bank_card TEXT')
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Egg batches table (persistent FIFO inventory)
+    c.execute('''CREATE TABLE IF NOT EXISTS egg_batches
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  home_id INTEGER,
+                  brought_by INTEGER,
+                  original_count INTEGER,
+                  remaining_count INTEGER,
+                  price_per_egg REAL,
+                  created_at TEXT)''')
+
+    # Egg debts table (created eagerly when someone eats eggs, reset each week)
+    c.execute('''CREATE TABLE IF NOT EXISTS egg_debts
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  home_id INTEGER,
+                  debtor_id INTEGER,
+                  creditor_id INTEGER,
+                  amount REAL,
+                  week_number INTEGER,
+                  created_at TEXT)''')
+
     conn.commit()
     conn.close()
 
@@ -111,6 +138,108 @@ def create_user(user_id, username, name):
     c = conn.cursor()
     c.execute('INSERT OR REPLACE INTO users (user_id, username, name) VALUES (?, ?, ?)',
               (user_id, username, name))
+    conn.commit()
+    conn.close()
+
+def save_bank_card(user_id, bank_card):
+    """Save or clear user's bank card"""
+    conn = sqlite3.connect('apartment_bot.db')
+    c = conn.cursor()
+    c.execute('UPDATE users SET bank_card = ? WHERE user_id = ?', (bank_card, user_id))
+    conn.commit()
+    conn.close()
+
+def get_bank_card(user_id):
+    """Get user's bank card number"""
+    conn = sqlite3.connect('apartment_bot.db')
+    c = conn.cursor()
+    c.execute('SELECT bank_card FROM users WHERE user_id = ?', (user_id,))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result and result[0] else None
+
+def add_egg_batch(home_id, brought_by, count, price_per_egg):
+    """Add a new egg batch to FIFO inventory"""
+    conn = sqlite3.connect('apartment_bot.db')
+    c = conn.cursor()
+    c.execute('''INSERT INTO egg_batches
+                 (home_id, brought_by, original_count, remaining_count, price_per_egg, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?)''',
+              (home_id, brought_by, count, count, price_per_egg, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_total_eggs(home_id):
+    """Get total remaining eggs in inventory"""
+    conn = sqlite3.connect('apartment_bot.db')
+    c = conn.cursor()
+    c.execute('SELECT COALESCE(SUM(remaining_count), 0) FROM egg_batches WHERE home_id = ? AND remaining_count > 0',
+              (home_id,))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result else 0
+
+def eat_eggs(home_id, eater_id, count):
+    """Apply FIFO egg consumption. Returns list of (creditor_id, amount) or None if not enough eggs."""
+    conn = sqlite3.connect('apartment_bot.db')
+    c = conn.cursor()
+
+    # Get available batches FIFO (oldest first)
+    c.execute('''SELECT id, brought_by, remaining_count, price_per_egg
+                 FROM egg_batches
+                 WHERE home_id = ? AND remaining_count > 0
+                 ORDER BY created_at ASC''', (home_id,))
+    batches = c.fetchall()
+
+    total_available = sum(b[2] for b in batches)
+    if total_available < count:
+        conn.close()
+        return None  # Not enough eggs
+
+    week_number = datetime.now().isocalendar()[1]
+    debts = []
+    remaining_to_eat = count
+
+    for batch_id, brought_by, remaining, price in batches:
+        if remaining_to_eat <= 0:
+            break
+        take = min(remaining, remaining_to_eat)
+        c.execute('UPDATE egg_batches SET remaining_count = remaining_count - ? WHERE id = ?',
+                  (take, batch_id))
+        if eater_id != brought_by:
+            amount = take * price
+            c.execute('''INSERT INTO egg_debts
+                         (home_id, debtor_id, creditor_id, amount, week_number, created_at)
+                         VALUES (?, ?, ?, ?, ?, ?)''',
+                      (home_id, eater_id, brought_by, amount, week_number, datetime.now().isoformat()))
+            debts.append((brought_by, amount))
+        remaining_to_eat -= take
+
+    conn.commit()
+    conn.close()
+    return debts
+
+def get_egg_debts_for_week(home_id, week_number=None):
+    """Get aggregated egg debts for settlement calculation"""
+    if week_number is None:
+        week_number = datetime.now().isocalendar()[1]
+    conn = sqlite3.connect('apartment_bot.db')
+    c = conn.cursor()
+    c.execute('''SELECT debtor_id, creditor_id, SUM(amount)
+                 FROM egg_debts
+                 WHERE home_id = ? AND week_number = ?
+                 GROUP BY debtor_id, creditor_id''',
+              (home_id, week_number))
+    result = c.fetchall()
+    conn.close()
+    return result  # [(debtor_id, creditor_id, amount)]
+
+def clear_egg_debts(home_id, week_number):
+    """Clear egg debts for a specific week"""
+    conn = sqlite3.connect('apartment_bot.db')
+    c = conn.cursor()
+    c.execute('DELETE FROM egg_debts WHERE home_id = ? AND week_number = ?',
+              (home_id, week_number))
     conn.commit()
     conn.close()
 
@@ -230,9 +359,72 @@ def cleanup_old_transactions():
     return deleted_count
 
 async def scheduled_cleanup(context: ContextTypes.DEFAULT_TYPE):
-    """Scheduled job to cleanup old transactions"""
+    """Scheduled job to send weekly calculations and cleanup old transactions"""
+    two_weeks_ago = (datetime.now() - timedelta(weeks=2)).isoformat()
+
+    # Find all home+week combos with old transactions
+    conn = sqlite3.connect('apartment_bot.db')
+    c = conn.cursor()
+    c.execute('''SELECT DISTINCT home_id, week_number
+                 FROM transactions WHERE created_at < ?''', (two_weeks_ago,))
+    old_homes_weeks = c.fetchall()
+    conn.close()
+
+    for home_id, week_number in old_homes_weeks:
+        transactions = get_week_transactions(home_id, week_number)
+        if not transactions:
+            continue
+
+        members = get_home_members(home_id)
+        if not members:
+            continue
+
+        member_dict = {m[0]: m[1] for m in members}
+        egg_debts = get_egg_debts_for_week(home_id, week_number)
+        settlements = calculate_settlements(transactions, members, egg_debts)
+
+        # Send settlement summary to each member
+        for member_id, member_name, is_admin in members:
+            receives = [(member_dict[from_id], amount)
+                       for from_id, to_id, amount in settlements
+                       if to_id == member_id and from_id in member_dict]
+            gives = [(to_id, member_dict[to_id], amount)
+                    for from_id, to_id, amount in settlements
+                    if from_id == member_id and to_id in member_dict]
+
+            message = f"📊 <b>{week_number}-hafta yakuniy hisob-kitoblari</b>\n"
+            message += "=" * 30 + "\n\n"
+
+            if receives:
+                message += "💰 <b>Sizga pul beradigan kishilar:</b>\n"
+                for name, amount in receives:
+                    message += f"  • <b>{name}</b>: {amount:,.0f} so'm\n"
+                message += "\n"
+
+            if gives:
+                message += "💸 <b>Siz pul beradigan kishilar:</b>\n"
+                for to_id, name, amount in gives:
+                    card = get_bank_card(to_id)
+                    card_str = f"\n    💳 <code>{card}</code>" if card else ""
+                    message += f"  • <b>{name}</b>: <b>{amount:,.0f} so'm</b>{card_str}\n"
+                message += "\n"
+
+            if not receives and not gives:
+                message += "✅ Sizda hech qanday qarz yo'q!\n\n"
+
+            try:
+                await context.bot.send_message(chat_id=member_id, text=message, parse_mode='HTML')
+            except Exception as e:
+                logger.error(f"Could not send message to {member_id}: {e}")
+
+        clear_week_transactions(home_id, week_number)
+        clear_egg_debts(home_id, week_number)
+        logger.info(f"Uy {home_id}, hafta {week_number} hisob-kitoblari yuborildi va tozalandi")
+
+    # Safety net: delete any remaining old transactions
     deleted = cleanup_old_transactions()
-    logger.info(f"2 hafta oldingi {deleted} ta harajatlar o'chirib tashlandi")
+    if deleted:
+        logger.info(f"2 hafta oldingi {deleted} ta qo'shimcha harajatlar o'chirib tashlandi")
 
 def parse_amount(text):
     """Parse amount from text, handling spaces in numbers"""
@@ -243,7 +435,7 @@ def parse_amount(text):
     except ValueError:
         return None
 
-def calculate_settlements(transactions, members):
+def calculate_settlements(transactions, members, egg_debts=None):
     """
     Calculate optimized settlements using net balance method
     Returns list of (from_user, to_user, amount) tuples
@@ -251,17 +443,23 @@ def calculate_settlements(transactions, members):
     # Calculate net balance for each member
     balances = defaultdict(float)
     member_dict = {m[0]: m[1] for m in members}
-    
+
     for trans_id, payer_id, amount, consumers_str in transactions:
         consumer_ids = [int(x) for x in consumers_str.split(',')]
         share = amount / len(consumer_ids)
-        
+
         # Payer paid the full amount
         balances[payer_id] += amount
-        
+
         # Each consumer owes their share
         for consumer_id in consumer_ids:
             balances[consumer_id] -= share
+
+    # Add egg debts to balances
+    if egg_debts:
+        for debtor_id, creditor_id, amount in egg_debts:
+            balances[debtor_id] -= amount
+            balances[creditor_id] += amount
     
     # Separate creditors and debtors
     creditors = [(uid, bal) for uid, bal in balances.items() if bal > 0.01]
@@ -299,26 +497,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # User manual - shown to ALL users
     user_manual = (
-        "Foydalanish qoidalari ‼️\n\n"
-        "Botdan foydalanish uchun ismingizni kiring. Qolganlarni adashtirmaslik uchun "
-        "ismingizni to'g'ri kiriting !\n\n"
-        "1. Uyga qo'shiling. Agar yaratilmagan bo'lsa uy nomi va parolni yarating. "
-        "Uy yaratuvchisi Admin hisoblanadi\n\n"
+        "<b>Foydalanish qoidalari ‼️</b>\n\n"
+        "Ismingizni to'g'ri kiriting — qolgan a'zolar sizni shu ism bilan taniydi.\n\n"
+        "1. Uyga qo'shiling. Agar yaratilmagan bo'lsa — uy nomi va parol yarating. "
+        "Uy yaratuvchisi <b>Admin</b> hisoblanadi.\n\n"
         "2. Uy nomi va parolni sheriklaringizga bering.\n\n"
-        "3. Hamma qo'shilganiga ishonch hosil qilgandan keyin qilingan harajatlani "
-        "yozishingiz mumkin.\n\n"
-        "4. Qilinga harajatlarni 14 000 yoki 14000 shaklida yozishingiz mumkin\n\n"
-        "5. Istalgan vaqt Admin eski ma'lumotlani o'chirib, mavjud pul o'tkazmalari "
-        "haqida barcha uy a'zolariga xabar jo'natishi mumkin.\n\n"
-        "6. Oddiy foydalanuvchilar har doim o'ziga tegishli pul o'tkazmalarini "
-        "ko'rishlari mumkin."
-
-
-
-
+        "3. Hamma qo'shilgandan keyin harajatlarni yozishni boshlashingiz mumkin.\n\n"
+        "<b>💰 Harajat qo'shish:</b>\n"
+        "Qilinga harajatni yozing (masalan: <b>14000</b> yoki <b>14 000</b>).\n"
+        "Bot sababini va kim iste'mol qilganini so'raydi. "
+        "Harajat tanlangan a'zolar o'rtasida teng bo'linadi.\n\n"
+        "<b>🥚 Tuxum hisobi:</b>\n"
+        "Tuxumlar sonini yozing (masalan: <b>6</b>)\n"
+        "Bot sizdan «Men tuxum olib keldim» yoki «Men tuxum yedim» deb so'raydi.\n"
+        "• Olib kelsangiz — bir tuxum narxini kiriting. Tuxum ombori to'ldiriladi.\n"
+        "• Yesangiz — tuxum olib kelgan odamdan qarz bo'lasiz va u haftalik hisob-kitobga yoziladi.\n"
+        "Tuxum qarzi umumiy hisob-kitobga qo'shiladi.\n\n"
+        "<b>📊 Hisob-kitob:</b>\n"
+        "• «Hisoblarni ko'rish» — faqat siz ko'rasiz, harajatlar o'chirilmaydi.\n"
+        "• «Hisoblarni ko'rish (Yangilash)» <b>(Admin)</b> — barcha a'zolarga yuboriladi "
+        "va harajatlar tozalanadi.\n"
+        "• Har 2 haftada bot avtomatik hisob-kitob qilib, eski harajatlarni o'chiradi.\n\n"
+        "<b>💳 Bank karta:</b> raqamingizni kiritsangiz, boshqalar to'lash uchun uni ko'radi.\n\n"
+        "<b>Admin:</b> a'zolarni o'chirish, uy nomi/parolini o'zgartirish imkoniyati bor."
     )
 
-    await update.message.reply_text(user_manual)
+    await update.message.reply_text(user_manual, parse_mode='HTML')
 
     existing_user = get_user(user.id)
     if existing_user and existing_user[2] and existing_user[3]:  # Has name AND home
@@ -346,18 +550,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ENTER_NAME
 
 async def enter_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Store user's name and ask if they want to create or join home"""
+    """Store user's name and ask for bank card"""
     name = update.message.text.strip()
     user = update.effective_user
-    
+
     create_user(user.id, user.username, name)
     context.user_data['name'] = name
 
-    keyboard = [['Uy yaratish', 'Uyga qo\'shilish']]
+    keyboard = [["O'tkazib yuborish"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
 
     await update.message.reply_text(
         f"Tanishganimdan xursandman, {name}!\n\n"
+        "💳 Bank karta raqamingizni kiriting:\n"
+        "(To'lovlarni amalga oshirishda foydalaniladi)\n\n"
+        "Agar kiritmoqchi bo'lmasangiz, \"O'tkazib yuborish\" tugmasini bosing.",
+        reply_markup=reply_markup
+    )
+    return ENTER_BANK_CARD
+
+async def enter_bank_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save bank card during registration and proceed to create/join"""
+    text = update.message.text.strip()
+    user = update.effective_user
+
+    if text != "O'tkazib yuborish":
+        save_bank_card(user.id, text)
+
+    keyboard = [['Uy yaratish', "Uyga qo'shilish"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+
+    await update.message.reply_text(
         "Yangi uy yaratmoqchimisiz yoki mavjud uyga qo'shilmoqchimisiz?",
         reply_markup=reply_markup
     )
@@ -660,6 +883,23 @@ async def change_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return CREATE_OR_JOIN
 
+async def update_bank_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Update bank card from main menu"""
+    text = update.message.text.strip()
+    user = update.effective_user
+
+    if text == 'Bekor qilish':
+        await update.message.reply_text("❌ Amal bekor qilindi.")
+    elif text == "O'chirish":
+        save_bank_card(user.id, None)
+        await update.message.reply_text("🗑 Bank karta raqami o'chirildi.")
+    else:
+        save_bank_card(user.id, text)
+        await update.message.reply_text(f"✅ Bank karta raqami saqlandi: {text}")
+
+    await menu(update, context)
+    return ConversationHandler.END
+
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show main menu based on user role"""
     user = update.effective_user
@@ -677,12 +917,14 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             ['Uyni boshqarish'],
             ['Hisoblarni ko\'rish (Yangilash)', 'Hisoblarni ko\'rish'],
-            ['Ismni o\'zgartirish', 'Uydan chiqish']
+            ['Ismni o\'zgartirish', 'Bank kartani o\'zgartirish'],
+            ['Uydan chiqish']
         ]
     else:
         keyboard = [
             ['Hisoblarni ko\'rish'],
-            ['Ismni o\'zgartirish', 'Uydan chiqish']
+            ['Ismni o\'zgartirish', 'Bank kartani o\'zgartirish'],
+            ['Uydan chiqish']
         ]
 
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -734,6 +976,18 @@ async def handle_menu_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return CHANGE_USER_NAME
 
+    elif choice == 'Bank kartani o\'zgartirish':
+        current_card = get_bank_card(user.id)
+        current_info = f"\nJoriy karta: {current_card}" if current_card else ""
+        keyboard = [["O'chirish", 'Bekor qilish']]
+        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        await update.message.reply_text(
+            f"💳 Bank kartani o'zgartirish{current_info}\n\n"
+            "Yangi karta raqamingizni kiriting:",
+            reply_markup=reply_markup
+        )
+        return ENTER_BANK_CARD
+
     elif choice == 'Uydan chiqish':
         await quit_home(update, context)
 
@@ -755,8 +1009,9 @@ async def send_calculations(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     members = get_home_members(home_id)
     member_dict = {m[0]: m[1] for m in members}
 
-    # Calculate settlements
-    settlements = calculate_settlements(transactions, members)
+    # Calculate settlements (including egg debts)
+    egg_debts = get_egg_debts_for_week(home_id, week_number)
+    settlements = calculate_settlements(transactions, members, egg_debts)
 
     if refresh:
         # Refresh mode: Send to ALL members and clear transactions
@@ -766,35 +1021,38 @@ async def send_calculations(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             receives = [(member_dict[from_id], amount)
                        for from_id, to_id, amount in settlements
                        if to_id == member_id and from_id in member_dict]
-            gives = [(member_dict[to_id], amount)
+            gives = [(to_id, member_dict[to_id], amount)
                     for from_id, to_id, amount in settlements
                     if from_id == member_id and to_id in member_dict]
 
-            message = f"📊 {week_number}-hafta hisob-kitoblari\n"
+            message = f"📊 <b>{week_number}-hafta hisob-kitoblari</b>\n"
             message += "=" * 30 + "\n\n"
 
             if receives:
-                message += "💰 Sizga pul beradigan kishilar:\n"
+                message += "💰 <b>Sizga pul beradigan kishilar:</b>\n"
                 for name, amount in receives:
-                    message += f"  • {name}: {amount:,.0f} so'm\n"
+                    message += f"  • <b>{name}</b>: {amount:,.0f} so'm\n"
                 message += "\n"
 
             if gives:
-                message += "💸 Siz pul beradigan kishilar:\n"
-                for name, amount in gives:
-                    message += f"  • {name}: {amount:,.0f} so'm\n"
+                message += "💸 <b>Siz pul beradigan kishilar:</b>\n"
+                for to_id, name, amount in gives:
+                    card = get_bank_card(to_id)
+                    card_str = f"\n    💳 <code>{card}</code>" if card else ""
+                    message += f"  • <b>{name}</b>: <b>{amount:,.0f} so'm</b>{card_str}\n"
                 message += "\n"
 
             if not receives and not gives:
                 message += "✅ Sizda hech qanday qarz yo'q!\n\n"
 
             try:
-                await context.bot.send_message(chat_id=member_id, text=message)
+                await context.bot.send_message(chat_id=member_id, text=message, parse_mode='HTML')
             except Exception as e:
                 logger.error(f"Could not send message to {member_id}: {e}")
 
-        # Clear the transactions after sending to everyone
+        # Clear the transactions and egg debts after sending to everyone
         clear_week_transactions(home_id, week_number)
+        clear_egg_debts(home_id, week_number)
         await update.message.reply_text(
             "✅ Hisob-kitoblar barcha a'zolarga yuborildi va harajatlar tozalandi!"
         )
@@ -805,23 +1063,25 @@ async def send_calculations(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         receives = [(member_dict[from_id], amount)
                    for from_id, to_id, amount in settlements
                    if to_id == member_id and from_id in member_dict]
-        gives = [(member_dict[to_id], amount)
+        gives = [(to_id, member_dict[to_id], amount)
                 for from_id, to_id, amount in settlements
                 if from_id == member_id and to_id in member_dict]
 
-        message = f"📊 {week_number}-hafta hisob-kitoblari (Sizning ko'rinishingiz)\n"
+        message = f"📊 <b>{week_number}-hafta hisob-kitoblari</b> (Sizning ko'rinishingiz)\n"
         message += "=" * 30 + "\n\n"
 
         if receives:
-            message += "💰 Sizga pul beradigan kishilar:\n"
+            message += "💰 <b>Sizga pul beradigan kishilar:</b>\n"
             for name, amount in receives:
-                message += f"  • {name}: {amount:,.0f} so'm\n"
+                message += f"  • <b>{name}</b>: {amount:,.0f} so'm\n"
             message += "\n"
 
         if gives:
-            message += "💸 Siz pul beradigan kishilar:\n"
-            for name, amount in gives:
-                message += f"  • {name}: {amount:,.0f} so'm\n"
+            message += "💸 <b>Siz pul beradigan kishilar:</b>\n"
+            for to_id, name, amount in gives:
+                card = get_bank_card(to_id)
+                card_str = f"\n     <code>{card}</code>" if card else ""
+                message += f"  • <b>{name}</b>: <b>{amount:,.0f} so'm</b>{card_str}\n\n"
             message += "\n"
 
         if not receives and not gives:
@@ -830,36 +1090,49 @@ async def send_calculations(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         message += "\n💡 Bu faqat sizga ko'rinadi.\n"
         message += "Harajatlar tozalanMADI."
 
-        await update.message.reply_text(message)
+        await update.message.reply_text(message, parse_mode='HTML')
 
 async def auto_detect_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Auto-detect numbers and start expense flow"""
+    """Auto-detect numbers: <100 starts egg flow, >=100 starts expense flow"""
     user = update.effective_user
     user_data = get_user(user.id)
 
-    # Check if user has a home
     if not user_data or not user_data[3]:
         return
 
-    # Try to parse as amount
     amount = parse_amount(update.message.text)
     if amount is None or amount <= 0:
         return
 
-    # Valid amount detected, start expense flow
+    home_id = user_data[3]
+
+    # Egg flow: number less than 100 = egg count
+    if amount < 100:
+        egg_count = int(amount)
+        context.user_data['egg_count'] = egg_count
+        total = get_total_eggs(home_id)
+
+        keyboard = [['Tuxum olib keldim', 'Tuxum yedim'], ['Bekor qilish']]
+        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        await update.message.reply_text(
+            f"🥚 {egg_count} ta tuxum\n\n"
+            f"(Hozir omborda: {total} ta)\n\n"
+            "Nima qildingiz?",
+            reply_markup=reply_markup
+        )
+        return EGG_ACTION
+
+    # Expense flow: number >= 100
     context.user_data['expense_amount'] = amount
 
-    # Ask for reason
     keyboard = [['Bekor qilish']]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-
     await update.message.reply_text(
         f"💰 Harajat: {amount:,.0f} so'm\n\n"
         "📝 Nima uchun sarflandi? (Mahsulotlarni kiriting)\n\n"
         "Har bir mahsulotni alohida qatorda yoki bir qatorda yozing:",
         reply_markup=reply_markup
     )
-
     return ENTER_REASON
 
 async def enter_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -908,14 +1181,14 @@ async def enter_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = "👥 Bu mahsulotni kim iste'mol qiladi?\n\n"
     message += "0. Barcha a'zolarni tanlash uchun\n"
     for idx, (member_id, name, is_admin) in enumerate(members, 1):
-        message += f"{idx}. {name}\n"
+        message += f"{idx}. <b>{name}</b>\n"
     message += "\nRaqamlarni bo'sh joy bilan ajratib kiriting (masalan, '1 3 5')\nYoki hammani tanlash uchun '0' ni kiriting:"
 
     keyboard = [['Bekor qilish']]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
 
     context.user_data['members_list'] = members
-    await update.message.reply_text(message, reply_markup=reply_markup)
+    await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='HTML')
 
     return ENTER_CONSUMERS
 
@@ -969,14 +1242,15 @@ async def enter_consumers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         share = amount / len(consumer_ids)
 
         # Send confirmation to user
-        consumer_list = '\n'.join(consumer_names)
+        consumer_list = '\n'.join(f"<b>{n}</b>" for n in consumer_names)
         await update.message.reply_text(
-            f"✅ Harajat yozildi!\n\n"
-            f"Miqdor: {amount:,.0f} so'm\n"
-            f"Sabab: {reason}\n"
+            f"✅ <b>Harajat yozildi!</b>\n\n"
+            f"Miqdor: <b>{amount:,.0f} so'm</b>\n"
+            f"Sabab: <b>{reason}</b>\n"
             f"Bo'linadi:\n\n"
             f"{consumer_list}\n\n"
-            f"Har biri to'laydi: {share:,.0f} so'm"
+            f"Har biri to'laydi: <b>{share:,.0f} so'm</b>",
+            parse_mode='HTML'
         )
 
         # Send notification to group
@@ -991,12 +1265,12 @@ async def enter_consumers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 consumer_text = '\n'.join([f"{idx}. {name}" for idx, name in enumerate(consumer_names, 1)])
 
             group_message = (
-                f"💸 Harajat: {amount:,.0f}\n\n"
+                f"💸 Harajat: <b>{amount:,.0f} so'm</b>\n\n"
                 f"📄 Sabab:\n\n"
-                f"{reason}\n\n"
+                f"<b>{reason}</b>\n\n"
                 f"👥 Iste'molchilar:\n\n"
                 f"{consumer_text}\n\n"
-                f"👤 Har biriga: {share:,.0f}"
+                f"👤 Har biriga: <b>{share:,.0f} so'm</b>"
             )
 
             try:
@@ -1004,7 +1278,8 @@ async def enter_consumers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=group_chat_id,
                     text=group_message,
-                    message_thread_id=message_thread_id
+                    message_thread_id=message_thread_id,
+                    parse_mode='HTML'
                 )
             except Exception as e:
                 logger.error(f"Guruhga xabar yuborib bo'lmadi: {e}")
@@ -1017,6 +1292,120 @@ async def enter_consumers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ Noto'g'ri format. Iltimos bo'sh joy bilan ajratib kiriting (masalan, '1 3 5')\n:"
         )
         return ENTER_CONSUMERS
+
+async def egg_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle egg action choice: bring or eat"""
+    choice = update.message.text
+    user = update.effective_user
+    user_data = get_user(user.id)
+    home_id = user_data[3]
+    egg_count = context.user_data['egg_count']
+
+    if choice == 'Bekor qilish':
+        await update.message.reply_text("❌ Bekor qilindi.")
+        await menu(update, context)
+        return ConversationHandler.END
+
+    elif choice == 'Tuxum olib keldim':
+        keyboard = [['Bekor qilish']]
+        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        await update.message.reply_text(
+            f"🥚 {egg_count} ta tuxum\n\n"
+            "Bir tuxumning narxini kiriting (so'mda):",
+            reply_markup=reply_markup
+        )
+        return EGG_PRICE
+
+    elif choice == 'Tuxum yedim':
+        total = get_total_eggs(home_id)
+        if egg_count > total:
+            await update.message.reply_text(
+                f"❌ Omborda faqat {total} ta tuxum bor. {egg_count} ta yeyish mumkin emas."
+            )
+            await menu(update, context)
+            return ConversationHandler.END
+
+        debts = eat_eggs(home_id, user.id, egg_count)
+        if debts is None:
+            await update.message.reply_text("❌ Omborda yetarli tuxum yo'q.")
+            await menu(update, context)
+            return ConversationHandler.END
+
+        members = get_home_members(home_id)
+        member_dict = {m[0]: m[1] for m in members}
+
+        msg = f"✅ {egg_count} ta tuxum yeganingiz qayd etildi."
+        if debts:
+            msg += "\n\n💸 Tuxum uchun to'lashingiz kerak:\n"
+            for creditor_id, amount in debts:
+                name = member_dict.get(creditor_id, "Noma'lum")
+                card = get_bank_card(creditor_id)
+                card_str = f"\n   💳 <code>{card}</code>" if card else ""
+                msg += f"  • {name}: {amount:,.0f} so'm{card_str}\n"
+
+        await update.message.reply_text(msg, parse_mode='HTML')
+
+        await menu(update, context)
+        return ConversationHandler.END
+
+    else:
+        keyboard = [['Tuxum olib keldim', 'Tuxum yedim'], ['Bekor qilish']]
+        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        await update.message.reply_text("Iltimos, quyidagilardan birini tanlang:", reply_markup=reply_markup)
+        return EGG_ACTION
+
+
+async def egg_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle egg price input for bring flow"""
+    text = update.message.text.strip()
+
+    if text == 'Bekor qilish':
+        await update.message.reply_text("❌ Bekor qilindi.")
+        await menu(update, context)
+        return ConversationHandler.END
+
+    price = parse_amount(text)
+    if price is None or price <= 0:
+        await update.message.reply_text("❌ Noto'g'ri narx. Iltimos, raqam kiriting:")
+        return EGG_PRICE
+
+    user = update.effective_user
+    user_data = get_user(user.id)
+    home_id = user_data[3]
+    egg_count = context.user_data['egg_count']
+
+    add_egg_batch(home_id, user.id, egg_count, price)
+    total = get_total_eggs(home_id)
+
+    await update.message.reply_text(
+        f"✅ {egg_count} ta tuxum qo'shildi!\n\n"
+        f"Narxi: {price:,.0f} so'm/dona\n\n"
+        f"Ombordagi jami: {total} ta tuxum"
+    )
+
+    # Group notification
+    members = get_home_members(home_id)
+    member_dict = {m[0]: m[1] for m in members}
+    group_chat_id, message_thread_id = get_group_chat_id(home_id)
+    if group_chat_id:
+        user_name = member_dict.get(user.id, user.first_name)
+        group_msg = (
+            f"🥚 {user_name} {egg_count} ta tuxum olib keldi\n"
+            f"Narxi: {price:,.0f} so'm/dona\n"
+            f"Omborda jami: {total} ta"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=group_chat_id,
+                text=group_msg,
+                message_thread_id=message_thread_id
+            )
+        except Exception as e:
+            logger.error(f"Guruhga xabar yuborib bo'lmadi: {e}")
+
+    await menu(update, context)
+    return ConversationHandler.END
+
 
 async def manage_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle manage home menu"""
@@ -1230,6 +1619,7 @@ def main():
         entry_points=[CommandHandler('start', start)],
         states={
             ENTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_name)],
+            ENTER_BANK_CARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_bank_card)],
             CREATE_OR_JOIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_or_join)],
             CREATE_HOME_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_home_name)],
             CREATE_HOME_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_home_password)],
@@ -1241,12 +1631,14 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)],
     )
 
-    # Auto-detect expense conversation handler (when user sends a number)
+    # Auto-detect expense/egg conversation handler (when user sends a number)
     auto_expense_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, auto_detect_expense)],
         states={
             ENTER_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_reason)],
             ENTER_CONSUMERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_consumers)],
+            EGG_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, egg_action)],
+            EGG_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, egg_price)],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
     )
@@ -1272,12 +1664,22 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)],
     )
 
+    # Change bank card conversation handler
+    change_bank_card_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^Bank kartani o\'zgartirish$'), handle_menu_choice)],
+        states={
+            ENTER_BANK_CARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, update_bank_card)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+
     # DEBUG: Add this first to see ALL messages
     application.add_handler(MessageHandler(filters.ALL, debug_all_messages), group=-1)
 
     application.add_handler(conv_handler)
     application.add_handler(manage_handler)
     application.add_handler(change_name_handler)
+    application.add_handler(change_bank_card_handler)
     application.add_handler(CommandHandler('menu', menu))
     application.add_handler(MessageHandler(
         filters.Regex(r"^(Hisoblarni ko'rish|Hisoblarni ko'rish \(Yangilash\)|Uydan chiqish)$"),
