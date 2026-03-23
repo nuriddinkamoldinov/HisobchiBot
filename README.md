@@ -15,8 +15,8 @@ Telegram bot for managing shared apartment expenses among roommates.
 
 **1. Clone the repository**
 ```bash
-git clone <repo-url>
-cd Kvartira
+git clone https://github.com/nuriddinkamoldinov/HisobchiBot.git
+cd HisobchiBot
 ```
 
 **2. Create a virtual environment and install dependencies**
@@ -28,7 +28,6 @@ pip install -r requirements.txt
 
 **3. Configure the bot token**
 ```bash
-cp .env.example .env
 nano .env
 ```
 Set your token:
@@ -48,8 +47,8 @@ python3 apartment_expense_bot.py
 
 **1. Clone the repository**
 ```bash
-git clone <repo-url>
-cd Kvartira
+git clone https://github.com/nuriddinkamoldinov/HisobchiBot.git
+cd HisobchiBot
 ```
 
 **2. Create a virtual environment and install dependencies**
@@ -61,7 +60,6 @@ pip install -r requirements.txt
 
 **3. Configure the bot token**
 ```bash
-cp .env.example .env
 nano .env
 ```
 Set your token:
@@ -81,8 +79,8 @@ python3 apartment_expense_bot.py
 
 **1. Clone the repository**
 ```cmd
-git clone <repo-url>
-cd Kvartira
+git clone https://github.com/nuriddinkamoldinov/HisobchiBot.git
+cd HisobchiBot
 ```
 
 **2. Create a virtual environment and install dependencies**
@@ -115,20 +113,20 @@ This makes the bot start automatically on boot and restart if it crashes.
 
 **1. Create the service file**
 ```bash
-sudo nano /etc/systemd/system/Hisobchibot.service
+sudo nano /etc/systemd/system/HisobchiBot.service
 ```
 
 **2. Paste the following** (adjust username and paths if needed):
 ```ini
 [Unit]
-Description=Kvartira Telegram Bot
+Description=HisobchiBot
 After=network.target
 
 [Service]
 Type=simple
-User=nooriddin
-WorkingDirectory=/home/nooriddin/Projects/Python/TelegramBot/Kvartira
-ExecStart=/home/nooriddin/Projects/Python/TelegramBot/Kvartira/venv/bin/python3 /home/nooriddin/Projects/Python/TelegramBot/Kvartira/apartment_expense_bot.py
+User=[YOUR_USERNAME]
+WorkingDirectory=[YOUR_WORKING_DIR]
+ExecStart=[YOUR_EXEC_START_DIR]
 Restart=always
 RestartSec=5
 
@@ -139,17 +137,17 @@ WantedBy=multi-user.target
 **3. Enable and start**
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable Hisobchibot
-sudo systemctl start Hisobchibot
+sudo systemctl enable HisobchiBot
+sudo systemctl start HisobchiBot
 ```
 
 **Service management:**
 ```bash
-sudo systemctl status Hisobchibot    # check status
-sudo systemctl stop Hisobchibot      # stop
-sudo systemctl start Hisobchibot     # start
-sudo systemctl restart Hisobchibot   # restart after code changes
-journalctl -u Hisobchibot -f         # live logs
+sudo systemctl status HisobchiBot    # check status
+sudo systemctl stop HisobchiBot      # stop
+sudo systemctl start HisobchiBot     # start
+sudo systemctl restart HisobchiBot   # restart after code changes
+journalctl -u HisobchiBot -f         # live logs
 ```
 
 ---
@@ -171,8 +169,8 @@ nano ~/Library/LaunchAgents/com.hisobchibot.plist
     <string>com.hisobchibot</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/username/Kvartira/venv/bin/python3</string>
-        <string>/Users/username/Kvartira/apartment_expense_bot.py</string>
+        <string>/Users/username/HisobchiBot/venv/bin/python3</string>
+        <string>/Users/username/HisobchiBot/apartment_expense_bot.py</string>
     </array>
     <key>WorkingDirectory</key>
     <string>/Users/username/Kvartira</string>
@@ -212,7 +210,7 @@ This makes the bot start automatically on boot.
 Create `start_bot.bat` in the project folder:
 ```bat
 @echo off
-cd /d C:\path\to\Kvartira
+cd /d C:\path\to\HisobchiBot
 call venv\Scripts\activate
 python apartment_expense_bot.py
 ```
@@ -222,23 +220,23 @@ python apartment_expense_bot.py
 - Click **Create Basic Task**
 
 **3. Configure the task**
-- Name: `Hisobchibot`
+- Name: `HisobchiBot`
 - Trigger: **When the computer starts**
 - Action: **Start a program**
-- Program: `C:\path\to\Kvartira\start_bot.bat`
+- Program: `C:\path\to\HisobchiBot\start_bot.bat`
 - Check **"Run whether user is logged on or not"**
 - Check **"Run with highest privileges"**
 - Click Finish
 
 **4. Verify**
 
-Open Task Scheduler, find `Hisobchibot`, right-click → **Run** to test it.
+Open Task Scheduler, find `HisobchiBot`, right-click → **Run** to test it.
 
 **Task management (Command Prompt as Administrator):**
 ```cmd
-schtasks /run /tn "Hisobchibot"      # start
-schtasks /end /tn "Hisobchibot"      # stop
-schtasks /delete /tn "Hisobchibot"   # remove task
+schtasks /run /tn "HisobchiBot"      # start
+schtasks /end /tn "HisobchiBot"      # stop
+schtasks /delete /tn "HisobchiBot"   # remove task
 ```
 
 ---
@@ -263,9 +261,9 @@ launchctl start com.hisobchibot
 
 **Windows:**
 ```cmd
-schtasks /end /tn "Hisobchibot"
+schtasks /end /tn "HisobchiBot"
 del apartment_bot.db
-schtasks /run /tn "Hisobchibot"
+schtasks /run /tn "HisobchiBot"
 ```
 
 The database will be recreated automatically on next start.

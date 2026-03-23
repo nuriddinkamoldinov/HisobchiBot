@@ -16,7 +16,7 @@ from telegram.ext import (
     filters,
 )
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 from collections import defaultdict
 import re
 
@@ -425,6 +425,67 @@ async def scheduled_cleanup(context: ContextTypes.DEFAULT_TYPE):
     deleted = cleanup_old_transactions()
     if deleted:
         logger.info(f"2 hafta oldingi {deleted} ta qo'shimcha harajatlar o'chirib tashlandi")
+
+async def send_weekly_summary(context: ContextTypes.DEFAULT_TYPE):
+    """Send weekly calculations to all homes every Sunday night, then clear the week's data"""
+    week_number = datetime.now().isocalendar()[1]
+
+    conn = sqlite3.connect('apartment_bot.db')
+    c = conn.cursor()
+    c.execute('SELECT home_id FROM homes')
+    home_ids = [row[0] for row in c.fetchall()]
+    conn.close()
+
+    for home_id in home_ids:
+        transactions = get_week_transactions(home_id, week_number)
+        if not transactions:
+            continue
+
+        members = get_home_members(home_id)
+        if not members:
+            continue
+
+        member_dict = {m[0]: m[1] for m in members}
+        egg_debts = get_egg_debts_for_week(home_id, week_number)
+        settlements = calculate_settlements(transactions, members, egg_debts)
+
+        for member_id, member_name, is_admin in members:
+            receives = [(member_dict[from_id], amount)
+                       for from_id, to_id, amount in settlements
+                       if to_id == member_id and from_id in member_dict]
+            gives = [(to_id, member_dict[to_id], amount)
+                    for from_id, to_id, amount in settlements
+                    if from_id == member_id and to_id in member_dict]
+
+            message = f"📊 <b>{week_number}-hafta yakuniy hisob-kitoblari</b>\n"
+            message += "=" * 30 + "\n\n"
+
+            if receives:
+                message += "💰 <b>Sizga pul beradigan kishilar:</b>\n"
+                for name, amount in receives:
+                    message += f"  • <b>{name}</b>: {amount:,.0f} so'm\n"
+                message += "\n"
+
+            if gives:
+                message += "💸 <b>Siz pul beradigan kishilar:</b>\n"
+                for to_id, name, amount in gives:
+                    card = get_bank_card(to_id)
+                    card_str = f"\n    💳 <code>{card}</code>" if card else ""
+                    message += f"  • <b>{name}</b>: <b>{amount:,.0f} so'm</b>{card_str}\n"
+                message += "\n"
+
+            if not receives and not gives:
+                message += "✅ Sizda hech qanday qarz yo'q!\n\n"
+
+            try:
+                await context.bot.send_message(chat_id=member_id, text=message, parse_mode='HTML')
+            except Exception as e:
+                logger.error(f"Could not send message to {member_id}: {e}")
+
+        clear_week_transactions(home_id, week_number)
+        clear_egg_debts(home_id, week_number)
+        logger.info(f"Uy {home_id}, hafta {week_number} haftalik hisob-kitob yuborildi va tozalandi")
+
 
 def parse_amount(text):
     """Parse amount from text, handling spaces in numbers"""
@@ -1693,13 +1754,13 @@ def main():
     # Auto-detect expense handler should be last to not interfere with other handlers
     application.add_handler(auto_expense_handler)
 
-    # Schedule daily cleanup of old transactions (runs every 24 hours)
     job_queue = application.job_queue
-    job_queue.run_repeating(scheduled_cleanup, interval=timedelta(hours=24), first=10)
 
-    # Run cleanup on startup
-    cleanup_old_transactions()
-    logger.info("Boshlang'ich tozalash tugatildi")
+    # Send weekly summary every Sunday at 23:59 and clear the week's data
+    job_queue.run_daily(send_weekly_summary, time=dtime(23, 59, 0), days=(6,))
+
+    # Clean up transactions older than 2 weeks (runs every 24 hours)
+    job_queue.run_repeating(scheduled_cleanup, interval=timedelta(hours=24), first=10)
 
     # Start the bot
     logger.info("Bot ishga tushdi...")
