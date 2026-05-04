@@ -17,6 +17,7 @@ from telegram.ext import (
 )
 import sqlite3
 from datetime import datetime, timedelta, time as dtime
+from zoneinfo import ZoneInfo
 from collections import defaultdict
 import re
 
@@ -580,7 +581,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "va harajatlar tozalanadi.\n"
         "• Har 2 haftada bot avtomatik hisob-kitob qilib, eski harajatlarni o'chiradi.\n\n"
         "<b>💳 Bank karta:</b> raqamingizni kiritsangiz, boshqalar to'lash uchun uni ko'radi.\n\n"
-        "<b>Admin:</b> a'zolarni o'chirish, uy nomi/parolini o'zgartirish imkoniyati bor."
+        "<b>Admin:</b> a'zolarni o'chirish, uy nomi/parolini o'zgartirish imkoniyati bor.\n\n"
+        "Muammo va takliflar uchun: @thisisnuriddin"
     )
 
     await update.message.reply_text(user_manual, parse_mode='HTML')
@@ -1756,8 +1758,9 @@ def main():
 
     job_queue = application.job_queue
 
-    # Send weekly summary every Sunday at 23:59 and clear the week's data
-    job_queue.run_daily(send_weekly_summary, time=dtime(23, 59, 0), days=(6,))
+    # Send weekly summary every Sunday at 23:59 Tashkent time and clear the week's data
+    tz = ZoneInfo('Asia/Tashkent')
+    job_queue.run_daily(send_weekly_summary, time=dtime(23, 59, 0, tzinfo=tz), days=(6,))
 
     # Clean up transactions older than 2 weeks (runs every 24 hours)
     job_queue.run_repeating(scheduled_cleanup, interval=timedelta(hours=24), first=10)
