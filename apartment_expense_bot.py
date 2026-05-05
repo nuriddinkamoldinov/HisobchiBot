@@ -15,7 +15,8 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-import sqlite3
+import psycopg2
+import psycopg2.extras
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 from collections import defaultdict
@@ -36,86 +37,56 @@ logger = logging.getLogger(__name__)
  EGG_ACTION, EGG_PRICE) = range(21)
 
 # Database setup
+def get_conn():
+    """Get a PostgreSQL connection"""
+    return psycopg2.connect(os.environ['DATABASE_URL'], sslmode='require')
+
 def init_db():
-    """Initialize the SQLite database"""
-    conn = sqlite3.connect('apartment_bot.db')
+    """Initialize the PostgreSQL database"""
+    conn = get_conn()
     c = conn.cursor()
-    
-    # Users table
+
     c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (user_id INTEGER PRIMARY KEY,
+                 (user_id BIGINT PRIMARY KEY,
                   username TEXT,
                   name TEXT,
                   home_id INTEGER,
-                  is_admin INTEGER DEFAULT 0)''')
-    
-    # Homes table
+                  is_admin INTEGER DEFAULT 0,
+                  bank_card TEXT)''')
+
     c.execute('''CREATE TABLE IF NOT EXISTS homes
-                 (home_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 (home_id SERIAL PRIMARY KEY,
                   home_name TEXT UNIQUE,
                   password TEXT,
                   created_at TEXT,
-                  group_chat_id INTEGER,
-                  message_thread_id INTEGER,
+                  group_chat_id BIGINT,
+                  message_thread_id BIGINT,
                   waiting_for_group INTEGER DEFAULT 0)''')
 
-    # Transactions table
     c.execute('''CREATE TABLE IF NOT EXISTS transactions
-                 (transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 (transaction_id SERIAL PRIMARY KEY,
                   home_id INTEGER,
-                  payer_id INTEGER,
+                  payer_id BIGINT,
                   amount REAL,
                   reason TEXT,
                   consumers TEXT,
                   created_at TEXT,
                   week_number INTEGER)''')
 
-    # Add group_chat_id column to existing homes table if it doesn't exist
-    try:
-        c.execute('ALTER TABLE homes ADD COLUMN group_chat_id INTEGER')
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-
-    # Add message_thread_id column to existing homes table if it doesn't exist
-    try:
-        c.execute('ALTER TABLE homes ADD COLUMN message_thread_id INTEGER')
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-
-    # Add waiting_for_group column to existing homes table if it doesn't exist
-    try:
-        c.execute('ALTER TABLE homes ADD COLUMN waiting_for_group INTEGER DEFAULT 0')
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-
-    # Add reason column to existing transactions table if it doesn't exist
-    try:
-        c.execute('ALTER TABLE transactions ADD COLUMN reason TEXT')
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-
-    # Add bank_card column to existing users table if it doesn't exist
-    try:
-        c.execute('ALTER TABLE users ADD COLUMN bank_card TEXT')
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-
-    # Egg batches table (persistent FIFO inventory)
     c.execute('''CREATE TABLE IF NOT EXISTS egg_batches
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 (id SERIAL PRIMARY KEY,
                   home_id INTEGER,
-                  brought_by INTEGER,
+                  brought_by BIGINT,
                   original_count INTEGER,
                   remaining_count INTEGER,
                   price_per_egg REAL,
                   created_at TEXT)''')
 
-    # Egg debts table (created eagerly when someone eats eggs, reset each week)
     c.execute('''CREATE TABLE IF NOT EXISTS egg_debts
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 (id SERIAL PRIMARY KEY,
                   home_id INTEGER,
-                  debtor_id INTEGER,
-                  creditor_id INTEGER,
+                  debtor_id BIGINT,
+                  creditor_id BIGINT,
                   amount REAL,
                   week_number INTEGER,
                   created_at TEXT)''')
@@ -126,55 +97,55 @@ def init_db():
 # Database helper functions
 def get_user(user_id):
     """Get user from database"""
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    c.execute('SELECT * FROM users WHERE user_id = %s', (user_id,))
     user = c.fetchone()
     conn.close()
     return user
 
 def create_user(user_id, username, name):
     """Create new user"""
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('INSERT OR REPLACE INTO users (user_id, username, name) VALUES (?, ?, ?)',
+    c.execute('INSERT INTO users (user_id, username, name) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET username=EXCLUDED.username, name=EXCLUDED.name',
               (user_id, username, name))
     conn.commit()
     conn.close()
 
 def save_bank_card(user_id, bank_card):
     """Save or clear user's bank card"""
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('UPDATE users SET bank_card = ? WHERE user_id = ?', (bank_card, user_id))
+    c.execute('UPDATE users SET bank_card = %s WHERE user_id = %s', (bank_card, user_id))
     conn.commit()
     conn.close()
 
 def get_bank_card(user_id):
     """Get user's bank card number"""
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('SELECT bank_card FROM users WHERE user_id = ?', (user_id,))
+    c.execute('SELECT bank_card FROM users WHERE user_id = %s', (user_id,))
     result = c.fetchone()
     conn.close()
     return result[0] if result and result[0] else None
 
 def add_egg_batch(home_id, brought_by, count, price_per_egg):
     """Add a new egg batch to FIFO inventory"""
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
     c.execute('''INSERT INTO egg_batches
                  (home_id, brought_by, original_count, remaining_count, price_per_egg, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?)''',
+                 VALUES (%s, %s, %s, %s, %s, %s)''',
               (home_id, brought_by, count, count, price_per_egg, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
 def get_total_eggs(home_id):
     """Get total remaining eggs in inventory"""
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('SELECT COALESCE(SUM(remaining_count), 0) FROM egg_batches WHERE home_id = ? AND remaining_count > 0',
+    c.execute('SELECT COALESCE(SUM(remaining_count), 0) FROM egg_batches WHERE home_id = %s AND remaining_count > 0',
               (home_id,))
     result = c.fetchone()
     conn.close()
@@ -182,13 +153,13 @@ def get_total_eggs(home_id):
 
 def eat_eggs(home_id, eater_id, count):
     """Apply FIFO egg consumption. Returns list of (creditor_id, amount) or None if not enough eggs."""
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
 
     # Get available batches FIFO (oldest first)
     c.execute('''SELECT id, brought_by, remaining_count, price_per_egg
                  FROM egg_batches
-                 WHERE home_id = ? AND remaining_count > 0
+                 WHERE home_id = %s AND remaining_count > 0
                  ORDER BY created_at ASC''', (home_id,))
     batches = c.fetchall()
 
@@ -205,13 +176,13 @@ def eat_eggs(home_id, eater_id, count):
         if remaining_to_eat <= 0:
             break
         take = min(remaining, remaining_to_eat)
-        c.execute('UPDATE egg_batches SET remaining_count = remaining_count - ? WHERE id = ?',
+        c.execute('UPDATE egg_batches SET remaining_count = remaining_count - %s WHERE id = %s',
                   (take, batch_id))
         if eater_id != brought_by:
             amount = take * price
             c.execute('''INSERT INTO egg_debts
                          (home_id, debtor_id, creditor_id, amount, week_number, created_at)
-                         VALUES (?, ?, ?, ?, ?, ?)''',
+                         VALUES (%s, %s, %s, %s, %s, %s)''',
                       (home_id, eater_id, brought_by, amount, week_number, datetime.now().isoformat()))
             debts.append((brought_by, amount))
         remaining_to_eat -= take
@@ -224,11 +195,11 @@ def get_egg_debts_for_week(home_id, week_number=None):
     """Get aggregated egg debts for settlement calculation"""
     if week_number is None:
         week_number = datetime.now().isocalendar()[1]
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
     c.execute('''SELECT debtor_id, creditor_id, SUM(amount)
                  FROM egg_debts
-                 WHERE home_id = ? AND week_number = ?
+                 WHERE home_id = %s AND week_number = %s
                  GROUP BY debtor_id, creditor_id''',
               (home_id, week_number))
     result = c.fetchall()
@@ -237,39 +208,39 @@ def get_egg_debts_for_week(home_id, week_number=None):
 
 def clear_egg_debts(home_id, week_number):
     """Clear egg debts for a specific week"""
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('DELETE FROM egg_debts WHERE home_id = ? AND week_number = ?',
+    c.execute('DELETE FROM egg_debts WHERE home_id = %s AND week_number = %s',
               (home_id, week_number))
     conn.commit()
     conn.close()
 
 def create_home(home_name, password, admin_id):
     """Create new home"""
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
     try:
-        c.execute('INSERT INTO homes (home_name, password, created_at) VALUES (?, ?, ?)',
+        c.execute('INSERT INTO homes (home_name, password, created_at) VALUES (%s, %s, %s) RETURNING home_id',
                   (home_name, password, datetime.now().isoformat()))
-        home_id = c.lastrowid
-        c.execute('UPDATE users SET home_id = ?, is_admin = 1 WHERE user_id = ?',
+        home_id = c.fetchone()[0]
+        c.execute('UPDATE users SET home_id = %s, is_admin = 1 WHERE user_id = %s',
                   (home_id, admin_id))
         conn.commit()
         conn.close()
         return home_id
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         conn.close()
         return None
 
 def join_home(user_id, home_name, password):
     """Join existing home"""
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('SELECT home_id, password FROM homes WHERE home_name = ?', (home_name,))
+    c.execute('SELECT home_id, password FROM homes WHERE home_name = %s', (home_name,))
     result = c.fetchone()
-    
+
     if result and result[1] == password:
-        c.execute('UPDATE users SET home_id = ? WHERE user_id = ?', (result[0], user_id))
+        c.execute('UPDATE users SET home_id = %s WHERE user_id = %s', (result[0], user_id))
         conn.commit()
         conn.close()
         return True
@@ -278,18 +249,18 @@ def join_home(user_id, home_name, password):
 
 def get_home_members(home_id):
     """Get all members of a home"""
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('SELECT user_id, name, is_admin FROM users WHERE home_id = ?', (home_id,))
+    c.execute('SELECT user_id, name, is_admin FROM users WHERE home_id = %s', (home_id,))
     members = c.fetchall()
     conn.close()
     return members
 
 def get_group_chat_id(home_id):
     """Get group chat ID and message thread ID for a home"""
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('SELECT group_chat_id, message_thread_id FROM homes WHERE home_id = ?', (home_id,))
+    c.execute('SELECT group_chat_id, message_thread_id FROM homes WHERE home_id = %s', (home_id,))
     result = c.fetchone()
     conn.close()
     if result:
@@ -298,21 +269,21 @@ def get_group_chat_id(home_id):
 
 def set_group_chat_id(home_id, group_chat_id, message_thread_id=None):
     """Set group chat ID and message thread ID for a home"""
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('UPDATE homes SET group_chat_id = ?, message_thread_id = ? WHERE home_id = ?',
+    c.execute('UPDATE homes SET group_chat_id = %s, message_thread_id = %s WHERE home_id = %s',
               (group_chat_id, message_thread_id, home_id))
     conn.commit()
     conn.close()
 
 def add_transaction(home_id, payer_id, amount, reason, consumers):
     """Add a transaction to the database"""
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
     week_number = datetime.now().isocalendar()[1]
     c.execute('''INSERT INTO transactions
                  (home_id, payer_id, amount, reason, consumers, created_at, week_number)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                 VALUES (%s, %s, %s, %s, %s, %s, %s)''',
               (home_id, payer_id, amount, reason, ','.join(map(str, consumers)),
                datetime.now().isoformat(), week_number))
     conn.commit()
@@ -322,12 +293,12 @@ def get_week_transactions(home_id, week_number=None):
     """Get all transactions for current week"""
     if week_number is None:
         week_number = datetime.now().isocalendar()[1]
-    
-    conn = sqlite3.connect('apartment_bot.db')
+
+    conn = get_conn()
     c = conn.cursor()
     c.execute('''SELECT transaction_id, payer_id, amount, consumers 
                  FROM transactions 
-                 WHERE home_id = ? AND week_number = ?''',
+                 WHERE home_id = %s AND week_number = %s''',
               (home_id, week_number))
     transactions = c.fetchall()
     conn.close()
@@ -335,23 +306,23 @@ def get_week_transactions(home_id, week_number=None):
 
 def clear_week_transactions(home_id, week_number):
     """Clear transactions for a specific week"""
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('DELETE FROM transactions WHERE home_id = ? AND week_number = ?',
+    c.execute('DELETE FROM transactions WHERE home_id = %s AND week_number = %s',
               (home_id, week_number))
     conn.commit()
     conn.close()
 
 def cleanup_old_transactions():
     """Delete transactions older than 2 weeks"""
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
 
     # Calculate date 2 weeks ago
     two_weeks_ago = (datetime.now() - timedelta(weeks=2)).isoformat()
 
     # Delete old transactions
-    c.execute('DELETE FROM transactions WHERE created_at < ?', (two_weeks_ago,))
+    c.execute('DELETE FROM transactions WHERE created_at < %s', (two_weeks_ago,))
     deleted_count = c.rowcount
 
     conn.commit()
@@ -364,10 +335,10 @@ async def scheduled_cleanup(context: ContextTypes.DEFAULT_TYPE):
     two_weeks_ago = (datetime.now() - timedelta(weeks=2)).isoformat()
 
     # Find all home+week combos with old transactions
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
     c.execute('''SELECT DISTINCT home_id, week_number
-                 FROM transactions WHERE created_at < ?''', (two_weeks_ago,))
+                 FROM transactions WHERE created_at < %s''', (two_weeks_ago,))
     old_homes_weeks = c.fetchall()
     conn.close()
 
@@ -431,7 +402,7 @@ async def send_weekly_summary(context: ContextTypes.DEFAULT_TYPE):
     """Send weekly calculations to all homes every Sunday night, then clear the week's data"""
     week_number = datetime.now().isocalendar()[1]
 
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
     c.execute('SELECT home_id FROM homes')
     home_ids = [row[0] for row in c.fetchall()]
@@ -522,34 +493,34 @@ def calculate_settlements(transactions, members, egg_debts=None):
         for debtor_id, creditor_id, amount in egg_debts:
             balances[debtor_id] -= amount
             balances[creditor_id] += amount
-    
+
     # Separate creditors and debtors
     creditors = [(uid, bal) for uid, bal in balances.items() if bal > 0.01]
     debtors = [(uid, -bal) for uid, bal in balances.items() if bal < -0.01]
-    
+
     # Sort by amount
     creditors.sort(key=lambda x: x[1], reverse=True)
     debtors.sort(key=lambda x: x[1], reverse=True)
-    
+
     # Calculate settlements
     settlements = []
     i, j = 0, 0
-    
+
     while i < len(creditors) and j < len(debtors):
         creditor_id, credit = creditors[i]
         debtor_id, debt = debtors[j]
-        
+
         amount = min(credit, debt)
         settlements.append((debtor_id, creditor_id, amount))
-        
+
         creditors[i] = (creditor_id, credit - amount)
         debtors[j] = (debtor_id, debt - amount)
-        
+
         if creditors[i][1] < 0.01:
             i += 1
         if debtors[j][1] < 0.01:
             j += 1
-    
+
     return settlements
 
 # Bot handlers
@@ -599,7 +570,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Qaytganingiz bilan, {existing_user[2]}!\n\n"
             "Siz hali hech qaysi uyga qo'shilmagansiz. Uy yaratmoqchimisiz yoki mavjud uyga qo'shilmoqchimisiz?\n"
-            "Yoki ismingizni o'zgartirmoqchimisiz?",
+            "Yoki ismingizni o'zgartirmoqchimisiz%s",
             reply_markup=reply_markup
         )
         context.user_data['name'] = existing_user[2]
@@ -644,7 +615,7 @@ async def enter_bank_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
 
     await update.message.reply_text(
-        "Yangi uy yaratmoqchimisiz yoki mavjud uyga qo'shilmoqchimisiz?",
+        "Yangi uy yaratmoqchimisiz yoki mavjud uyga qo'shilmoqchimisiz%s",
         reply_markup=reply_markup
     )
     return CREATE_OR_JOIN
@@ -693,9 +664,9 @@ async def create_home_password(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if home_id:
         # Set waiting_for_group flag in database
-        conn = sqlite3.connect('apartment_bot.db')
+        conn = get_conn()
         c = conn.cursor()
-        c.execute('UPDATE homes SET waiting_for_group = 1 WHERE home_id = ?', (home_id,))
+        c.execute('UPDATE homes SET waiting_for_group = 1 WHERE home_id = %s', (home_id,))
         conn.commit()
         conn.close()
 
@@ -741,12 +712,12 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     logger.info(f"Group message from user {user.id} in chat {chat.id}")
 
     # Check if this user is waiting to connect a group
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
     c.execute('''SELECT h.home_id, h.home_name, h.password, h.waiting_for_group
                  FROM homes h
                  JOIN users u ON h.home_id = u.home_id
-                 WHERE u.user_id = ? AND u.is_admin = 1 AND h.waiting_for_group = 1''',
+                 WHERE u.user_id = %s AND u.is_admin = 1 AND h.waiting_for_group = 1''',
               (user.id,))
     result = c.fetchone()
     conn.close()
@@ -765,9 +736,9 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     set_group_chat_id(home_id, chat.id, message_thread_id)
 
     # Clear waiting flag
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('UPDATE homes SET waiting_for_group = 0 WHERE home_id = ?', (home_id,))
+    c.execute('UPDATE homes SET waiting_for_group = 0 WHERE home_id = %s', (home_id,))
     conn.commit()
     conn.close()
 
@@ -889,7 +860,7 @@ async def join_home_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     password = update.message.text.strip()
     home_name = context.user_data['join_home_name']
     user = update.effective_user
-    
+
     if join_home(user.id, home_name, password):
         await update.message.reply_text(f"✅ '{home_name}' uyiga muvaffaqiyatli qo'shildingiz!")
         await menu(update, context)
@@ -923,9 +894,9 @@ async def change_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user
 
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('UPDATE users SET name = ? WHERE user_id = ?', (new_name, user.id))
+    c.execute('UPDATE users SET name = %s WHERE user_id = %s', (new_name, user.id))
     conn.commit()
     conn.close()
 
@@ -941,7 +912,7 @@ async def change_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             f"✅ Ismingiz '{new_name}' ga o'zgartirildi\n\n"
-            "Uy yaratmoqchimisiz yoki mavjud uyga qo'shilmoqchimisiz?",
+            "Uy yaratmoqchimisiz yoki mavjud uyga qo'shilmoqchimisiz%s",
             reply_markup=reply_markup
         )
         return CREATE_OR_JOIN
@@ -967,7 +938,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show main menu based on user role"""
     user = update.effective_user
     user_data = get_user(user.id)
-    
+
     if not user_data or not user_data[3]:  # No home
         await update.message.reply_text(
             "Siz hali hech qaysi uyga qo'shilmagansiz. Uy yaratish yoki qo'shilish uchun /start buyrug'idan foydalaning."
@@ -1004,7 +975,7 @@ async def handle_menu_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     choice = update.message.text
     user = update.effective_user
     user_data = get_user(user.id)
-    
+
     if not user_data or not user_data[3]:
         await update.message.reply_text("Iltimos, avval /start buyrug'idan foydalaning.")
         return
@@ -1192,7 +1163,7 @@ async def auto_detect_expense(update: Update, context: ContextTypes.DEFAULT_TYPE
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text(
         f"💰 Harajat: {amount:,.0f} so'm\n\n"
-        "📝 Nima uchun sarflandi? (Mahsulotlarni kiriting)\n\n"
+        "📝 Nima uchun sarflandi%s (Mahsulotlarni kiriting)\n\n"
         "Har bir mahsulotni alohida qatorda yoki bir qatorda yozing:",
         reply_markup=reply_markup
     )
@@ -1241,7 +1212,7 @@ async def enter_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     members = get_home_members(home_id)
 
     # Show members list
-    message = "👥 Bu mahsulotni kim iste'mol qiladi?\n\n"
+    message = "👥 Bu mahsulotni kim iste'mol qiladi%s\n\n"
     message += "0. Barcha a'zolarni tanlash uchun\n"
     for idx, (member_id, name, is_admin) in enumerate(members, 1):
         message += f"{idx}. <b>{name}</b>\n"
@@ -1536,13 +1507,13 @@ async def edit_home_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = get_user(user.id)
     home_id = user_data[3]
 
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
     try:
-        c.execute('UPDATE homes SET home_name = ? WHERE home_id = ?', (new_name, home_id))
+        c.execute('UPDATE homes SET home_name = %s WHERE home_id = %s', (new_name, home_id))
         conn.commit()
         await update.message.reply_text(f"✅ Uy nomi '{new_name}' ga o'zgartirildi")
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         await update.message.reply_text("❌ Bunday uy nomi mavjud. Boshqa nom bilan urinib ko'ring")
     finally:
         conn.close()
@@ -1564,9 +1535,9 @@ async def edit_home_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_data = get_user(user.id)
     home_id = user_data[3]
 
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('UPDATE homes SET password = ? WHERE home_id = ?', (new_password, home_id))
+    c.execute('UPDATE homes SET password = %s WHERE home_id = %s', (new_password, home_id))
     conn.commit()
     conn.close()
 
@@ -1592,9 +1563,9 @@ async def delete_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         member_id, member_name = members_list[number - 1]
 
-        conn = sqlite3.connect('apartment_bot.db')
+        conn = get_conn()
         c = conn.cursor()
-        c.execute('UPDATE users SET home_id = NULL, is_admin = 0 WHERE user_id = ?', (member_id,))
+        c.execute('UPDATE users SET home_id = NULL, is_admin = 0 WHERE user_id = %s', (member_id,))
         conn.commit()
         conn.close()
 
@@ -1635,9 +1606,9 @@ async def quit_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await menu(update, context)
             return
 
-    conn = sqlite3.connect('apartment_bot.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('UPDATE users SET home_id = NULL, is_admin = 0 WHERE user_id = ?', (user.id,))
+    c.execute('UPDATE users SET home_id = NULL, is_admin = 0 WHERE user_id = %s', (user.id,))
     conn.commit()
     conn.close()
 

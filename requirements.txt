@@ -1,3 +1,3 @@
 python-telegram-bot[job-queue]==20.7
 httpx==0.25.2
-python-dotenv
+python-dotenvpsycopg2-binary
