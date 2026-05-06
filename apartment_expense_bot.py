@@ -694,9 +694,14 @@ async def create_home_password(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return ConversationHandler.END
 
+BLOCKED_USERS = [1661391319]
+
 async def debug_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Debug: Log ALL messages"""
     if update.message:
+        user_id = update.effective_user.id
+        if user_id in BLOCKED_USERS:
+            return  # silently ignore blocked users
         logger.info(f"[DEBUG] Message received: chat_type={update.effective_chat.type}, user={update.effective_user.id}, text={update.message.text[:50] if update.message.text else 'no text'}")
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
