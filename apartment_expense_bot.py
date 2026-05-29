@@ -1736,7 +1736,7 @@ def main():
 
     # Send weekly summary every Sunday at 23:59 Tashkent time and clear the week's data
     tz = ZoneInfo('Asia/Tashkent')
-    job_queue.run_daily(send_weekly_summary, time=dtime(23, 59, 0, tzinfo=tz), days=(6,))
+    job_queue.run_daily(send_weekly_summary, time=dtime(23, 59, 0, tzinfo=tz), days=(0,))
 
     # Clean up transactions older than 2 weeks (runs every 24 hours)
     job_queue.run_repeating(scheduled_cleanup, interval=timedelta(hours=24), first=10)
