@@ -267,3 +267,5 @@ schtasks /run /tn "HisobchiBot"
 ```
 
 The database will be recreated automatically on next start.
+
+<!-- deploy-webhook end-to-end test -->
