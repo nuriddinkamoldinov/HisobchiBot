@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # Database setup
 def get_conn():
     """Get a PostgreSQL connection"""
-    return psycopg2.connect(os.environ['DATABASE_URL'], sslmode='require')
+    return psycopg2.connect(os.environ['DATABASE_URL'], sslmode=os.environ.get('DB_SSLMODE', 'prefer'))
 
 def init_db():
     """Initialize the PostgreSQL database"""
