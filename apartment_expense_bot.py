@@ -570,7 +570,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Qaytganingiz bilan, {existing_user[2]}!\n\n"
             "Siz hali hech qaysi uyga qo'shilmagansiz. Uy yaratmoqchimisiz yoki mavjud uyga qo'shilmoqchimisiz?\n"
-            "Yoki ismingizni o'zgartirmoqchimisiz%s",
+            "Yoki ismingizni o'zgartirmoqchimisiz?",
             reply_markup=reply_markup
         )
         context.user_data['name'] = existing_user[2]
@@ -615,7 +615,7 @@ async def enter_bank_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
 
     await update.message.reply_text(
-        "Yangi uy yaratmoqchimisiz yoki mavjud uyga qo'shilmoqchimisiz%s",
+        "Yangi uy yaratmoqchimisiz yoki mavjud uyga qo'shilmoqchimisiz?",
         reply_markup=reply_markup
     )
     return CREATE_OR_JOIN
@@ -917,7 +917,7 @@ async def change_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             f"✅ Ismingiz '{new_name}' ga o'zgartirildi\n\n"
-            "Uy yaratmoqchimisiz yoki mavjud uyga qo'shilmoqchimisiz%s",
+            "Uy yaratmoqchimisiz yoki mavjud uyga qo'shilmoqchimisiz?",
             reply_markup=reply_markup
         )
         return CREATE_OR_JOIN
@@ -1168,7 +1168,7 @@ async def auto_detect_expense(update: Update, context: ContextTypes.DEFAULT_TYPE
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text(
         f"💰 Harajat: {amount:,.0f} so'm\n\n"
-        "📝 Nima uchun sarflandi%s (Mahsulotlarni kiriting)\n\n"
+        "📝 Nima uchun sarflandi? (Mahsulotlarni kiriting)\n\n"
         "Har bir mahsulotni alohida qatorda yoki bir qatorda yozing:",
         reply_markup=reply_markup
     )
@@ -1217,7 +1217,7 @@ async def enter_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     members = get_home_members(home_id)
 
     # Show members list
-    message = "👥 Bu mahsulotni kim iste'mol qiladi%s\n\n"
+    message = "👥 Bu mahsulotni kim iste'mol qiladi?\n\n"
     message += "0. Barcha a'zolarni tanlash uchun\n"
     for idx, (member_id, name, is_admin) in enumerate(members, 1):
         message += f"{idx}. <b>{name}</b>\n"
